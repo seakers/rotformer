@@ -1,0 +1,3 @@
+[submodule "TuckER"]
+	path = TuckER
+	url = https://github.com/ibalazevic/TuckER.git

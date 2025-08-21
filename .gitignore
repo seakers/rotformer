@@ -1,0 +1,16 @@
+# Environment files
+*.env
+
+# Pycache
+__pycache__/
+
+# Models
+*.pth
+
+# Visual Studio Code
+.vscode/
+
+# Virtual Environments
+.venv/
+
+# Scripts
