@@ -14,3 +14,8 @@ __pycache__/
 .venv/
 
 # Scripts
+cuda_learning.py
+ModifiedTorchObjects.py
+multigpu.py
+RotNumFormerCustom.py
+test.py

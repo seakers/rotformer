@@ -1,18 +1,20 @@
-from load_data import Data
+from TuckER.load_data import Data
 import numpy as np
 import torch
 import time
 from collections import defaultdict
-from model import *
+from TuckER.TuckerModified import *
 from torch.optim.lr_scheduler import ExponentialLR
+
 import argparse
 import os
-from scripts.RotTransformer import RotTransformer
+from RotTransformer import RotTransformer
+from RotnumFormer import RotnumFormer
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
-class Experiment:
+class Trainer:
 
     def __init__(self, learning_rate=0.0005, d_emb=200, num_iterations=500, batch_size=128, decay_rate=0., cuda=False, 
                  input_dropout=0.3, hidden_dropout1=0.4, hidden_dropout2=0.5, label_smoothing=0., triplet_trans_heads=8,
@@ -44,7 +46,8 @@ class Experiment:
 
     def get_batch(self, er_vocab, er_vocab_pairs, idx):
         batch = er_vocab_pairs[idx:idx+self.batch_size]
-        targets = np.zeros((len(batch), len(d.entities)))
+        ## BIG CHANGE IDK IF I CAN DO THIS ##
+        targets = np.zeros((len(batch), len(d.entities)+2))
         for idx, pair in enumerate(batch):
             targets[idx, er_vocab[pair]] = 1.
         targets = torch.FloatTensor(targets)
@@ -53,7 +56,7 @@ class Experiment:
         return np.array(batch), targets
 
     
-    def evaluate(self, model, data):
+    def evaluate(self, model, data, mode):
         hits = []
         ranks = []
         for i in range(10):
@@ -61,6 +64,8 @@ class Experiment:
 
         test_data_idxs = self.get_data_idxs(data)
         er_vocab = self.get_er_vocab(self.get_data_idxs(d.data))
+        if mode =="valid": model.contextual_triplets = d.valid_contextual_triplets
+        elif mode == "test" : model.contextual_triplets = d.test_contextual_triplets
 
         print("Number of data points: %d" % len(test_data_idxs))
         
@@ -73,15 +78,15 @@ class Experiment:
                 e1_idx = e1_idx.cuda()
                 r_idx = r_idx.cuda()
                 e2_idx = e2_idx.cuda()
-            predictions = model.forward(e1_idx, r_idx)
+            _, graph_predictions = model.forward(e1_idx, r_idx)
 
             for j in range(data_batch.shape[0]):
                 filt = er_vocab[(data_batch[j][0], data_batch[j][1])]
-                target_value = predictions[j,e2_idx[j]].item()
-                predictions[j, filt] = 0.0
-                predictions[j, e2_idx[j]] = target_value
+                target_value = graph_predictions[j,e2_idx[j]].item()
+                graph_predictions[j, filt] = 0.0
+                graph_predictions[j, e2_idx[j]] = target_value
 
-            sort_values, sort_idxs = torch.sort(predictions, dim=1, descending=True)
+            sort_values, sort_idxs = torch.sort(graph_predictions, dim=1, descending=True)
 
             sort_idxs = sort_idxs.cpu().numpy()
             for j in range(data_batch.shape[0]):
@@ -105,17 +110,19 @@ class Experiment:
 
     def train_and_eval(self):
         print("Training the RotTransformer model...")
-        self.entity_idxs = {d.entities[i]:i for i in range(len(d.entities))}
-        self.relation_idxs = {d.relations[i]:i for i in range(len(d.relations))}
+        self.entity_idxs = d.entity_idxs
+        self.relation_idxs = d.relation_idxs
 
         train_data_idxs = self.get_data_idxs(d.train_data)
         print("Number of training data points: %d" % len(train_data_idxs))
 
-        model = RotTransformer(d_emb = self.d_emb, n_entities = len(d.entities), n_relations = len(d.relations), contextual_triplets = d.contextual_triplets,
+        model = RotnumFormer(d_emb = self.d_emb, n_entities = len(d.entities), n_relations = len(d.relations), contextual_triplets = d.train_contextual_triplets,
                                triplet_trans_heads = self.triplet_trans_heads, triplet_trans_layers = self.triplet_trans_layers,
-                               graph_trans_heads = self.graph_trans_heads, graph_trans_layers = self.graph_trans_layers, **self.kwargs)
+                               graph_trans_heads = self.graph_trans_heads, graph_trans_layers = self.graph_trans_layers, 
+                               batch_first=True, **self.kwargs)
         if self.cuda:
             model.cuda()
+            model.device = "cuda"
         opt = torch.optim.Adam(model.parameters(), lr=self.learning_rate)
         if self.decay_rate:
             scheduler = ExponentialLR(opt, self.decay_rate)
@@ -125,10 +132,12 @@ class Experiment:
 
         print("Starting training...")
         for it in range(1, self.num_iterations+1):
+            model.contextual_triplets = d.train_contextual_triplets
             start_train = time.time()
             model.train()    
             losses = []
             np.random.shuffle(er_vocab_pairs)
+            #for j in range(0, 10, self.batch_size):
             for j in range(0, len(er_vocab_pairs), self.batch_size):
                 data_batch, targets = self.get_batch(er_vocab, er_vocab_pairs, j)
                 opt.zero_grad()
@@ -137,10 +146,12 @@ class Experiment:
                 if self.cuda:
                     e1_idx = e1_idx.cuda()
                     r_idx = r_idx.cuda()
-                predictions = model.forward(e1_idx, r_idx)
+                triplet_predictions, graph_predictions = model.forward(e1_idx, r_idx)
                 if self.label_smoothing:
                     targets = ((1.0-self.label_smoothing)*targets) + (1.0/targets.size(1))           
-                loss = model.loss(predictions, targets)
+                triplet_loss = model.loss(triplet_predictions, targets)
+                graph_loss = model.loss(graph_predictions,targets)
+                loss = triplet_loss+graph_loss
                 loss.backward()
                 opt.step()
                 losses.append(loss.item())
@@ -152,15 +163,14 @@ class Experiment:
             model.eval()
             with torch.no_grad():
                 print("Validation:")
-                self.evaluate(model, d.valid_data)
-                if not it%2:
-                    print("Test:")
-                    start_test = time.time()
-                    self.evaluate(model, d.test_data)
-                    print(time.time()-start_test)
-           
-
+                self.evaluate(model, d.valid_data, "valid")
         
+        with torch.no_grad():
+            print("Test:")
+            start_test = time.time()
+            self.evaluate(model, d.test_data, "test")
+            print(time.time()-start_test)
+           
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -174,7 +184,7 @@ if __name__ == '__main__':
                     help="Learning rate.")
     parser.add_argument("--dr", type=float, default=1.0, nargs="?",
                     help="Decay rate.")
-    parser.add_argument("--demb", type=int, default=200, nargs="?",
+    parser.add_argument("--demb", type=int, default=256, nargs="?",
                     help="Embedding dimensionality.")
     parser.add_argument("--cuda", type=bool, default=True, nargs="?",
                     help="Whether to use cuda (GPU) or not (CPU).")
@@ -198,16 +208,16 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     dataset = args.dataset
-    data_dir = "data/%s/" % dataset
+    data_dir = "TuckER/data/%s/" % dataset
     torch.backends.cudnn.deterministic = True 
     seed = 20
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available:
         torch.cuda.manual_seed_all(seed) 
-    d = Data(data_dir=data_dir, reverse=True)
-    experiment = Experiment(num_iterations=args.num_iterations, batch_size=args.batch_size, learning_rate=args.lr, 
-                            decay_rate=args.dr, demb=args.demb, rel_vec_dim=args.rdim, cuda=args.cuda,
+    d = Data(data_dir=data_dir, reverse=False)
+    experiment = Trainer(num_iterations=args.num_iterations, batch_size=args.batch_size, learning_rate=args.lr, 
+                            decay_rate=args.dr, d_emb=args.demb, cuda=args.cuda,
                             input_dropout=args.input_dropout, hidden_dropout1=args.hidden_dropout1, 
                             hidden_dropout2=args.hidden_dropout2, label_smoothing=args.label_smoothing,
                             triplet_trans_heads=args.triplet_heads, triplet_trans_layers=args.triplet_layers,

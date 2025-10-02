@@ -7,15 +7,42 @@ import torch.nn as nn
 from torch.nn import functional as F
 from torch import Tensor
 from torch.nn.init import xavier_uniform_
-from torch.nn.parameter import Parameter, Tensor
+from torch.nn.parameter import Parameter
 from torch.nn.init import constant_, xavier_normal_, xavier_uniform_
 
 from torch.nn.modules.activation import MultiheadAttention
-from torch.nn.modules.activation import ModuleList
-from torch.nn.modules.activation import Dropout
-from torch.nn.modules.activation import Linear
-from torch.nn.modules.activation import Module
-from torch.nn.modules.activation import LayerNorm
+from torch.nn.modules.container import ModuleList
+from torch.nn.modules.dropout import Dropout
+from torch.nn.modules.linear import Linear
+from torch.nn.modules.module import Module
+from torch.nn.modules.normalization import LayerNorm
+
+def _generate_square_subsequent_mask(
+    sz: int,
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
+) -> Tensor:
+    r"""Generate a square causal mask for the sequence.
+
+    The masked positions are filled with float('-inf'). Unmasked positions are filled with float(0.0).
+    """
+    return torch.triu(
+        torch.full((sz, sz), float("-inf"), dtype=dtype, device=device),
+        diagonal=1,
+    )
+
+def _get_seq_len(src: Tensor, batch_first: bool) -> Optional[int]:
+    if src.is_nested:
+        return None
+    else:
+        src_size = src.size()
+        if len(src_size) == 2:
+            # unbatched: S, E
+            return src_size[0]
+        else:
+            # batched: B, S, E if batch_first else S, B, E
+            seq_len_pos = 1 if batch_first else 0
+            return src_size[seq_len_pos]
 
 class TransformerEncoderRelationBias(nn.Module):
     """TransformerEncoder is a stack of N encoder layers.
@@ -100,6 +127,7 @@ class TransformerEncoderRelationBias(nn.Module):
     def forward(
         self,
         src: Tensor,
+        relation_bias : Tensor,
         mask: Optional[Tensor] = None,
         src_key_padding_mask: Optional[Tensor] = None,
         is_causal: Optional[bool] = None,
@@ -226,6 +254,7 @@ class TransformerEncoderRelationBias(nn.Module):
         for mod in self.layers:
             output = mod(
                 output,
+                relation_bias,
                 src_mask=mask,
                 is_causal=is_causal,
                 src_key_padding_mask=src_key_padding_mask_for_layers,
@@ -324,7 +353,7 @@ class TransformerEncoderLayerRelationBias(nn.Module):
     def __init__(
         self,
         d_model: int,
-        nhead: int,
+        num_heads: int,
         dim_feedforward: int = 2048,
         dropout: float = 0.1,
         activation: Union[str, Callable[[Tensor], Tensor]] = F.relu,
@@ -338,8 +367,8 @@ class TransformerEncoderLayerRelationBias(nn.Module):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.self_attn = MultiheadAttentionRelationBias(
-            d_model,
-            nhead,
+            d_emb=d_model,
+            num_heads=num_heads,
             dropout=dropout,
             bias=bias,
             batch_first=batch_first,
@@ -378,6 +407,7 @@ class TransformerEncoderLayerRelationBias(nn.Module):
     def forward(
         self,
         src: Tensor,
+        relation_bias: Tensor,
         src_mask: Optional[Tensor] = None,
         src_key_padding_mask: Optional[Tensor] = None,
         is_causal: bool = False,
@@ -498,7 +528,7 @@ class TransformerEncoderLayerRelationBias(nn.Module):
                 )
                 return torch._transformer_encoder_layer_fwd(
                     src,
-                    self.self_attn.embed_dim,
+                    self.self_attn.d_emb,
                     self.self_attn.num_heads,
                     self.self_attn.in_proj_weight,
                     self.self_attn.in_proj_bias,
@@ -523,13 +553,13 @@ class TransformerEncoderLayerRelationBias(nn.Module):
         x = src
         if self.norm_first:
             x = x + self._sa_block(
-                self.norm1(x), src_mask, src_key_padding_mask, is_causal=is_causal
+                self.norm1(x), relation_bias, relation_bias, src_key_padding_mask, is_causal=is_causal
             )
             x = x + self._ff_block(self.norm2(x))
         else:
             x = self.norm1(
                 x
-                + self._sa_block(x, src_mask, src_key_padding_mask, is_causal=is_causal)
+                + self._sa_block(x, relation_bias, relation_bias, src_key_padding_mask, is_causal=is_causal)
             )
             x = self.norm2(x + self._ff_block(x))
 
@@ -539,6 +569,7 @@ class TransformerEncoderLayerRelationBias(nn.Module):
     def _sa_block(
         self,
         x: Tensor,
+        relation_bias: Tensor,
         attn_mask: Optional[Tensor],
         key_padding_mask: Optional[Tensor],
         is_causal: bool = False,
@@ -547,6 +578,7 @@ class TransformerEncoderLayerRelationBias(nn.Module):
             x,
             x,
             x,
+            relation_bias,
             attn_mask=attn_mask,
             key_padding_mask=key_padding_mask,
             need_weights=False,
@@ -563,19 +595,21 @@ class MultiheadAttentionRelationBias(nn.Module):
 
     def __init__(self,
                  d_emb,
-                 n_heads,
-                 relation_bias,
-                 dropout,
+                 num_heads,
+                 dropout=0.0,
                  bias=False,
+                 add_bias_kv = False,
+                 add_zero_attn = False,
                  d_k = None,
                  d_v = None,
+                 batch_first=False,
                  device = None,
                  dtype = None) -> None:
         
-        if d_emb <= 0 or n_heads <= 0:
+        if d_emb <= 0 or num_heads <= 0:
             raise ValueError(
                 f"embed_dim and num_heads must be greater than 0,"
-                f" got embed_dim={d_emb} and num_heads={n_heads} instead"
+                f" got embed_dim={d_emb} and num_heads={num_heads} instead"
             )
         
         factory_kwargs = {"device": device, "dtype": dtype}
@@ -583,32 +617,48 @@ class MultiheadAttentionRelationBias(nn.Module):
         self.d_emb = d_emb
         self.d_k = d_k if d_k is not None else d_emb
         self.d_v = d_v if d_v is not None else d_emb
-        self.relation_bias = relation_bias
+        self._qkv_same_embed_dim = self.d_k == d_emb and self.d_v == d_emb
 
-        self.n_heads = n_heads
+        self.num_heads = num_heads
         self.dropout = dropout
-        self.d_head = d_emb // n_heads
-        assert( self.d_head * n_heads == self.d_emb), "d_emb must be divisible by n_heads"
-
-        if not (self.d_k == self.d_emb and self.d_v == self.d_emb):
-
-            self.q_proj_weight = Parameter(torch.empty((n_heads, d_emb, d_k), **factory_kwargs))
-            self.k_proj_weight = Parameter(torch.empty((n_heads, d_emb, d_k), **factory_kwargs))
-            self.v_proj_weight = Parameter(torch.empty((n_heads, d_emb, d_v), **factory_kwargs))
+        self.batch_first = batch_first
+        self.d_head = d_emb // num_heads
+        assert( self.d_head * num_heads == self.d_emb), "d_emb must be divisible by num_heads"
+        
+        ## TEMPORARY NEEDS TO BE CHANGED BACK ##
+        if not self._qkv_same_embed_dim:
+            self.q_proj_weight = Parameter(torch.empty((self.num_heads, self.d_emb, self.d_k), **factory_kwargs))
+            self.k_proj_weight = Parameter(torch.empty((self.num_heads, self.d_emb, self.d_k), **factory_kwargs))
+            self.v_proj_weight = Parameter(torch.empty((self.num_heads, self.d_emb, self.d_v), **factory_kwargs))
+            self.register_parameter("in_proj_weight", None)
         
         else:
-            self.in_proj_weight = Parameter(torch.empty((3* d_emb, d_emb), **factory_kwargs))
+            self.in_proj_weight = Parameter(torch.empty((3* self.d_emb, self.d_emb), **factory_kwargs))
+            self.register_parameter("q_proj_weight", None)
+            self.register_parameter("k_proj_weight", None)
+            self.register_parameter("v_proj_weight", None)
 
         if bias:
-            self.in_proj_bias = Parameter(torch.empty(3*d_emb, **factory_kwargs))
+            self.in_proj_bias = Parameter(torch.empty(3*self.d_emb, **factory_kwargs))
+        else:
+            self.register_parameter("in_proj_bias", None)
 
-        self.out_proj_weight = Parameter(torch.empty((n_heads*d_v, d_emb), **factory_kwargs))
-        #self.out_proj = nn.modules.linear.NonDynamicallyQuantizableLinear(d_emb, d_emb, bias=bias, **factory_kwargs)
+        # self.out_proj_weight = Parameter(torch.empty((self.num_heads*self.d_v, self.d_emb), **factory_kwargs))
+        # self.out_proj = nn.modules.linear.NonDynamicallyQuantizableLinear(self.num_heads*self.d_v, d_emb, bias=bias, **factory_kwargs)
+        self.out_proj = nn.modules.linear.NonDynamicallyQuantizableLinear(d_emb, d_emb, bias=bias, **factory_kwargs)
 
+        if add_bias_kv:
+            self.bias_k = Parameter(torch.empty((1, 1, self.d_emb), **factory_kwargs))
+            self.bias_v = Parameter(torch.empty((1, 1, self.d_emb), **factory_kwargs))
+        else:
+            self.bias_k = self.bias_v = None
+        
+        self.add_zero_attn = add_zero_attn
 
         self._reset_parameters()
     
     def _reset_parameters(self) -> None:
+        ## TEMPORARY NEEDS TO BE CHANGED BACK ##
         if self._qkv_same_embed_dim:
             xavier_uniform_(self.in_proj_weight)
         else:
@@ -623,57 +673,360 @@ class MultiheadAttentionRelationBias(nn.Module):
             xavier_normal_(self.bias_k)
         if self.bias_v is not None:
             xavier_normal_(self.bias_v)
+    
+    def __setstate__(self, state):
+        # Support loading old MultiheadAttention checkpoints generated by v1.1.0
+        if "_qkv_same_embed_dim" not in state:
+            state["_qkv_same_embed_dim"] = True
+
+        super().__setstate__(state)
 
     def forward(self,
                 query,
                 key,
                 value,
-                scale
+                relation_bias,
+                key_padding_mask: Optional[Tensor] = None,
+                need_weights: bool = False, ## CHANGED VALUE
+                attn_mask: Optional[Tensor] = None,
+                average_attn_weights: bool = True,
+                is_causal: bool = False,
+                scale=None
                 ) -> torch.Tensor:
-        Q = torch.matmul(query,self.q_proj_weight)
-        K_t = torch.transpose(torch.matmul(key,self.k_proj_weight))
-        attention_scores = torch.softmax(torch.div(torch.matmul(Q,K_t), scale))
+        why_not_fast_path = ""
+        if (
+            (attn_mask is not None and torch.is_floating_point(attn_mask))
+            or (key_padding_mask is not None)
+            and torch.is_floating_point(key_padding_mask)
+        ):
+            why_not_fast_path = "floating-point masks are not supported for fast path."
+
+        is_batched = query.dim() == 3
+
+        key_padding_mask = F._canonical_mask(
+            mask=key_padding_mask,
+            mask_name="key_padding_mask",
+            other_type=F._none_or_dtype(attn_mask),
+            other_name="attn_mask",
+            target_type=query.dtype,
+        )
+
+        attn_mask = F._canonical_mask(
+            mask=attn_mask,
+            mask_name="attn_mask",
+            other_type=None,
+            other_name="",
+            target_type=query.dtype,
+            check_other=False,
+        )
+
+        is_fastpath_enabled = torch.backends.mha.get_fastpath_enabled()
+
+        if not is_fastpath_enabled:
+            why_not_fast_path = "torch.backends.mha.get_fastpath_enabled() was not True"
+        elif not is_batched:
+            why_not_fast_path = (
+                f"input not batched; expected query.dim() of 3 but got {query.dim()}"
+            )
+        elif query is not key or key is not value:
+            # When lifting this restriction, don't forget to either
+            # enforce that the dtypes all match or test cases where
+            # they don't!
+            why_not_fast_path = "non-self attention was used (query, key, and value are not the same Tensor)"
+        elif self.in_proj_bias is not None and query.dtype != self.in_proj_bias.dtype:
+            why_not_fast_path = f"dtypes of query ({query.dtype}) and self.in_proj_bias ({self.in_proj_bias.dtype}) don't match"
+        elif self.in_proj_weight is None:
+            why_not_fast_path = "in_proj_weight was None"
+        elif query.dtype != self.in_proj_weight.dtype:
+            # this case will fail anyway, but at least they'll get a useful error message.
+            why_not_fast_path = f"dtypes of query ({query.dtype}) and self.in_proj_weight ({self.in_proj_weight.dtype}) don't match"
+        elif self.training:
+            why_not_fast_path = "training is enabled"
+        elif (self.num_heads % 2) != 0:
+            why_not_fast_path = "self.num_heads is not even"
+        elif not self.batch_first:
+            why_not_fast_path = "batch_first was not True"
+        elif self.bias_k is not None:
+            why_not_fast_path = "self.bias_k was not None"
+        elif self.bias_v is not None:
+            why_not_fast_path = "self.bias_v was not None"
+        elif self.add_zero_attn:
+            why_not_fast_path = "add_zero_attn was enabled"
+        elif not self._qkv_same_embed_dim:
+            why_not_fast_path = "_qkv_same_embed_dim was not True"
+        elif query.is_nested and (
+            key_padding_mask is not None or attn_mask is not None
+        ):
+            why_not_fast_path = (
+                "supplying both src_key_padding_mask and src_mask at the same time \
+                                 is not supported with NestedTensor input"
+            )
+        elif torch.is_autocast_enabled():
+            why_not_fast_path = "autocast is enabled"
+
+        if not why_not_fast_path:
+            tensor_args = (
+                query,
+                key,
+                value,
+                self.in_proj_weight,
+                self.in_proj_bias,
+                self.out_proj.weight,
+                self.out_proj.bias,
+            )
+            # We have to use list comprehensions below because TorchScript does not support
+            # generator expressions.
+            if torch.overrides.has_torch_function(tensor_args):
+                why_not_fast_path = "some Tensor argument has_torch_function"
+            elif _is_make_fx_tracing():
+                why_not_fast_path = "we are running make_fx tracing"
+            elif not all(_check_arg_device(x) for x in tensor_args):
+                why_not_fast_path = (
+                    "some Tensor argument's device is neither one of "
+                    f"cpu, cuda or {torch.utils.backend_registration._privateuse1_backend_name}"
+                )
+            elif torch.is_grad_enabled() and any(
+                _arg_requires_grad(x) for x in tensor_args
+            ):
+                why_not_fast_path = (
+                    "grad is enabled and at least one of query or the "
+                    "input/output projection weights or biases requires_grad"
+                )
+            if not why_not_fast_path:
+                merged_mask, mask_type = self.merge_masks(
+                    attn_mask, key_padding_mask, query
+                )
+
+                if self.in_proj_bias is not None and self.in_proj_weight is not None:
+                    return torch._native_multi_head_attention(
+                        query,
+                        key,
+                        value,
+                        self.d_emb,
+                        self.num_heads,
+                        self.in_proj_weight,
+                        self.in_proj_bias,
+                        self.out_proj.weight,
+                        self.out_proj.bias,
+                        merged_mask,
+                        need_weights,
+                        average_attn_weights,
+                        mask_type,
+                    )
+
+        any_nested = query.is_nested or key.is_nested or value.is_nested
+        assert not any_nested, (
+            "MultiheadAttention does not support NestedTensor outside of its fast path. "
+            + f"The fast path was not hit because {why_not_fast_path}"
+        )
+
+        if self.batch_first and is_batched:
+            # make sure that the transpose op does not affect the "is" property
+            if key is value:
+                if query is key:
+                    query = key = value = query.transpose(1, 0)
+                else:
+                    query, key = (x.transpose(1, 0) for x in (query, key))
+                    value = key
+            else:
+                query, key, value = (x.transpose(1, 0) for x in (query, key, value))
         
-        V = torch.matmul(value, self.v_proj_weight)
-        attention_per_head = torch.matmul(attention_scores, V)
+        if not self._qkv_same_embed_dim:
+            attn_output, attn_output_weights = F.multi_head_attention_forward(
+                query,
+                key,
+                value,
+                self.d_emb,
+                self.num_heads,
+                self.in_proj_weight,
+                self.in_proj_bias,
+                self.bias_k,
+                self.bias_v,
+                self.add_zero_attn,
+                self.dropout,
+                self.out_proj.weight,
+                self.out_proj.bias,
+                training=self.training,
+                key_padding_mask=key_padding_mask,
+                need_weights=need_weights,
+                attn_mask=attn_mask,
+                use_separate_proj_weight=True,
+                q_proj_weight=self.q_proj_weight,
+                k_proj_weight=self.k_proj_weight,
+                v_proj_weight=self.v_proj_weight,
+                average_attn_weights=average_attn_weights,
+                is_causal=is_causal,
+            )
+        else:
+            attn_output, attn_output_weights = F.multi_head_attention_forward(
+                query,
+                key,
+                value,
+                self.d_emb,
+                self.num_heads,
+                self.in_proj_weight,
+                self.in_proj_bias,
+                self.bias_k,
+                self.bias_v,
+                self.add_zero_attn,
+                self.dropout,
+                self.out_proj.weight,
+                self.out_proj.bias,
+                training=self.training,
+                key_padding_mask=key_padding_mask,
+                need_weights=need_weights,
+                attn_mask=attn_mask,
+                average_attn_weights=average_attn_weights,
+                is_causal=is_causal,
+            )
+        if self.batch_first and is_batched:
+            return attn_output.transpose(1, 0), attn_output_weights
+        else:
+            return attn_output, attn_output_weights
 
-        attention = torch.cat((x for x in attention_per_head))
-        return attention_scores
+        # if scale == None: scale = self.d_k**(1/2)
 
-class TuckER(torch.nn.Module):
-    def __init__(self, d, d1, d2, **kwargs):
-        super(TuckER, self).__init__()
+        # Q = torch.matmul(query,self.q_proj_weight)
+        # Kt = torch.transpose(torch.matmul(key,self.k_proj_weight))
+        # Q_Kt = torch.softmax(torch.div(torch.matmul(Q,Kt), scale)+relation_bias)
+        
+        # V = torch.matmul(value, self.v_proj_weight)
+        # attention_per_head = torch.matmul(Q_Kt, V)
 
-        self.E = torch.nn.Embedding(len(d.entities), d1)
-        self.R = torch.nn.Embedding(len(d.relations), d2)
-        self.W = torch.nn.Parameter(torch.tensor(np.random.uniform(-1, 1, (d2, d1, d1)), 
-                                    dtype=torch.float, device="cuda", requires_grad=True))
-        xavier_normal_(self.E.weight.data)
-        xavier_normal_(self.R.weight.data)
-
-        self.input_dropout = torch.nn.Dropout(kwargs["input_dropout"])
-        self.hidden_dropout1 = torch.nn.Dropout(kwargs["hidden_dropout1"])
-        self.hidden_dropout2 = torch.nn.Dropout(kwargs["hidden_dropout2"])
-        self.loss = torch.nn.BCELoss()
-
-        self.bn0 = torch.nn.BatchNorm1d(d1)
-        self.bn1 = torch.nn.BatchNorm1d(d1)
+        # attention = torch.cat((x for x in attention_per_head))
+        # return attention
     
-    def forward(self, e1_idx, r_idx):
-        e1 = self.E(e1_idx)
-        x = self.bn0(e1)
-        x = self.input_dropout(x)
-        x = x.view(-1, 1, e1.size(1))
+    def merge_masks(
+    self,
+    attn_mask: Optional[Tensor],
+    key_padding_mask: Optional[Tensor],
+    query: Tensor,
+    ) -> tuple[Optional[Tensor], Optional[int]]:
+        r"""Determine mask type and combine masks if necessary.
 
-        r = self.R(r_idx)
-        W_mat = torch.mm(r, self.W.view(r.size(1), -1))
-        W_mat = W_mat.view(-1, e1.size(1), e1.size(1))
-        W_mat = self.hidden_dropout1(W_mat)
+        If only one mask is provided, that mask
+        and the corresponding mask type will be returned. If both masks are provided, they will be both
+        expanded to shape ``(batch_size, num_heads, seq_len, seq_len)``, combined with logical ``or``
+        and mask type 2 will be returned
+        Args:
+            attn_mask: attention mask of shape ``(seq_len, seq_len)``, mask type 0
+            key_padding_mask: padding mask of shape ``(batch_size, seq_len)``, mask type 1
+            query: query embeddings of shape ``(batch_size, seq_len, d_emb)``
+        Returns:
+            merged_mask: merged mask
+            mask_type: merged mask type (0, 1, or 2)
+        """
+        mask_type: Optional[int] = None
+        merged_mask: Optional[Tensor] = None
 
-        x = torch.bmm(x, W_mat) 
-        x = x.view(-1, e1.size(1))      
-        x = self.bn1(x)
-        x = self.hidden_dropout2(x)
-        x = torch.mm(x, self.E.weight.transpose(1,0))
-        pred = torch.sigmoid(x)
-        return pred
+        if key_padding_mask is not None:
+            mask_type = 1
+            merged_mask = key_padding_mask
+
+        if attn_mask is not None:
+            # In this branch query can't be a nested tensor, so it has a shape
+            batch_size, seq_len, _ = query.shape
+            mask_type = 2
+
+            # Always expands attn_mask to 4D
+            if attn_mask.dim() == 3:
+                attn_mask_expanded = attn_mask.view(batch_size, -1, seq_len, seq_len)
+            else:  # attn_mask.dim() == 2:
+                attn_mask_expanded = attn_mask.view(1, 1, seq_len, seq_len).expand(
+                    batch_size, self.num_heads, -1, -1
+                )
+            merged_mask = attn_mask_expanded
+
+            if key_padding_mask is not None:
+                key_padding_mask_expanded = key_padding_mask.view(
+                    batch_size, 1, 1, seq_len
+                ).expand(-1, self.num_heads, -1, -1)
+                merged_mask = attn_mask_expanded + key_padding_mask_expanded
+
+        # no attn_mask and no key_padding_mask, returns None, None
+        return merged_mask, mask_type
+    
+#### EXTRA FUNCTIONS USED BY TORCH ####
+
+def _get_clones(module, N):
+    # FIXME: copy.deepcopy() is not defined on nn.module
+    return ModuleList([copy.deepcopy(module) for i in range(N)])
+
+
+def _get_activation_fn(activation: str) -> Callable[[Tensor], Tensor]:
+    if activation == "relu":
+        return F.relu
+    elif activation == "gelu":
+        return F.gelu
+
+    raise RuntimeError(f"activation should be relu/gelu, not {activation}")
+
+def _detect_is_causal_mask(
+    mask: Optional[Tensor],
+    is_causal: Optional[bool] = None,
+    size: Optional[int] = None,
+) -> bool:
+    """Return whether the given attention mask is causal.
+
+    Warning:
+    If ``is_causal`` is not ``None``, its value will be returned as is.  If a
+    user supplies an incorrect ``is_causal`` hint,
+
+    ``is_causal=False`` when the mask is in fact a causal attention.mask
+       may lead to reduced performance relative to what would be achievable
+       with ``is_causal=True``;
+    ``is_causal=True`` when the mask is in fact not a causal attention.mask
+       may lead to incorrect and unpredictable execution - in some scenarios,
+       a causal mask may be applied based on the hint, in other execution
+       scenarios the specified mask may be used.  The choice may not appear
+       to be deterministic, in that a number of factors like alignment,
+       hardware SKU, etc influence the decision whether to use a mask or
+       rely on the hint.
+    ``size`` if not None, check whether the mask is a causal mask of the provided size
+       Otherwise, checks for any causal mask.
+    """
+    # Prevent type refinement
+    make_causal = is_causal is True
+
+    if is_causal is None and mask is not None:
+        sz = size if size is not None else mask.size(-2)
+        causal_comparison = _generate_square_subsequent_mask(
+            sz, device=mask.device, dtype=mask.dtype
+        )
+
+        # Do not use `torch.equal` so we handle batched masks by
+        # broadcasting the comparison.
+        if mask.size() == causal_comparison.size():
+            make_causal = bool((mask == causal_comparison).all())
+        else:
+            make_causal = False
+
+    return make_causal
+
+def _check_arg_device(x: Optional[torch.Tensor]) -> bool:
+    if x is not None:
+        return x.device.type in [
+            "cpu",
+            "cuda",
+            torch.utils.backend_registration._privateuse1_backend_name,
+        ]
+    return True
+
+
+def _arg_requires_grad(x: Optional[torch.Tensor]) -> bool:
+    if x is not None:
+        return x.requires_grad
+    return False
+
+
+def _is_make_fx_tracing():
+    if not torch.jit.is_scripting():
+        torch_dispatch_mode_stack = (
+            torch.utils._python_dispatch._get_current_dispatch_mode_stack()
+        )
+        return any(
+            type(x) == torch.fx.experimental.proxy_tensor.ProxyTorchDispatchMode
+            for x in torch_dispatch_mode_stack
+        )
+    else:
+        return False

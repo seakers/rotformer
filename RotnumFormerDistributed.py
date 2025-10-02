@@ -1,23 +1,21 @@
-import warnings
-from typing import Optional, Tuple
-import math
+import numpy as np
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch import Tensor
-from torch.nn.parameter import Parameter
-from TuckER.TuckerModified import TuckER
+    
+class RotationalEncoding(nn.Module):
+    def __init__(self, d_model, dropout=0.1, max_len=10000):
+        super(RotationalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
 
-
-#from utils import DataFromJSON
-from ModifiedTorchObjects import TransformerEncoderRelationBias, TransformerEncoderLayerRelationBias
-
-class RotTransformer(nn.Module):
+    def forward(self, x):
+        pass
+    
+class RotnumFormer(nn.Module):
 
     def __init__(self, d_emb, n_entities, n_relations, triplet_trans_heads, triplet_trans_layers, graph_trans_heads, graph_trans_layers,
                  contextual_triplets, max_context_triplets=2, batch_first=True, **kwargs):
-        super(RotTransformer, self).__init__()
+        super(RotnumFormer, self).__init__()
 
         ## Overall Model Settings
         self.d_emb = d_emb
@@ -34,6 +32,14 @@ class RotTransformer(nn.Module):
         self.entity_pass_idx = n_entities + 1
         self.relation_pass_idx = n_relations
 
+        ## TuckER Attributes
+        self.W = torch.nn.Parameter(torch.tensor(np.random.uniform(-1, 1, (d_emb, d_emb, d_emb)), dtype=torch.float, device="cuda", requires_grad=True))
+        self.input_dropout = torch.nn.Dropout(kwargs["input_dropout"])
+        self.hidden_dropout1 = torch.nn.Dropout(kwargs["hidden_dropout1"])
+        self.hidden_dropout2 = torch.nn.Dropout(kwargs["hidden_dropout2"])
+        self.bn0 = torch.nn.BatchNorm1d(d_emb)
+        self.bn1 = torch.nn.BatchNorm1d(d_emb)
+
         ## Triplet Transformer Attributes
         self.triplet_trans_heads =  triplet_trans_heads
         self.triplet_trans_layers = triplet_trans_layers
@@ -43,10 +49,9 @@ class RotTransformer(nn.Module):
         ## Graph Transformer Attributes
         self.graph_trans_heads =  graph_trans_heads
         self.graph_trans_layers = graph_trans_layers
-        layer = TransformerEncoderLayerRelationBias(self.d_emb, self.graph_trans_heads, batch_first=batch_first)
-        self.graph_transformer = TransformerEncoderRelationBias(layer, self.graph_trans_layers)
+        layer = nn.TransformerEncoderLayer(self.d_emb, self.graph_trans_heads, batch_first=batch_first)
+        self.graph_transformer = nn.TransformerEncoder(layer, self.graph_trans_layers)
 
-        self.tucker = TuckER(self.d_emb, **kwargs)
         self.loss = torch.nn.BCELoss()
 
     def rebatch_for_triplet_transformer(self, cooccur_idxs, relation_idxs, context_triplets, context_cooccur_locs, contextual_triplets_per_input:list[int]):
@@ -152,11 +157,28 @@ class RotTransformer(nn.Module):
         
         return True
 
-    def forward(self, cooccur_idxs, relation_idxs):
+    def forward_TuckER(self, e1, r):
+        x = self.bn0(e1)
+        x = self.input_dropout(x)
+        x = x.view(-1, 1, e1.size(1))
+
+        W_mat = torch.mm(r, self.W.view(r.size(1), -1))
+        W_mat = W_mat.view(-1, e1.size(1), e1.size(1))
+        W_mat = self.hidden_dropout1(W_mat)
+
+        x = torch.bmm(x, W_mat) 
+        x = x.view(-1, e1.size(1))     
+        x = self.bn1(x)
+        x = self.hidden_dropout2(x)
+        x = torch.matmul(x, self.E.weight.transpose(1,0))
+        x = torch.softmax(x, dim=1)
+
+        return x
+
+    def forward(self, cooccur_idxs, relation_idxs, contextual_triplets, contextual_cooccurring_locs, context_triplets_per_input):
         """
 
         """
-        contextual_triplets, contextual_cooccurring_locs, context_triplets_per_input = self.context_subgraph(cooccur_idxs)
 
         cooccur_context_idxs = self.rebatch_for_triplet_transformer(cooccur_idxs, relation_idxs,contextual_triplets, contextual_cooccurring_locs, context_triplets_per_input)
         out_triplet = self.triplet_transformer(cooccur_context_idxs)
@@ -170,7 +192,7 @@ class RotTransformer(nn.Module):
         for i in range(relation_bias.shape[0]):
             if not torch.equal(check[i][0],check[i][1]):
                 raise Exception("attn_mask is not equal across heads")
-        out_graph = self.graph_transformer(cooccur_entity_embeddings, attn_mask)
+        out_graph = self.graph_transformer(cooccur_entity_embeddings, mask=attn_mask)
         
         tucker_triplet_input = []
         idx = 0
@@ -181,44 +203,11 @@ class RotTransformer(nn.Module):
             count += 1
         tucker_triplet_input = torch.stack(tucker_triplet_input, dim=0).to(self.device)
 
-        tucker_triplet_output = self.tucker(tucker_triplet_input, anchor_relation_embedding)
-        tucker_triplet_output = torch.matmul(tucker_triplet_output, self.E.weight.transpose(1,0))
-        tucker_triplet_output = torch.softmax(tucker_triplet_output, dim=1)
+        tucker_triplet_output = self.forward_TuckER(tucker_triplet_input, anchor_relation_embedding)
 
         tucker_graph_input = [out_graph[count][0] for count in range(out_graph.shape[0])]
         tucker_graph_input = torch.stack(tucker_graph_input, dim=0).to(self.device)
 
-        tucker_graph_output = self.tucker(tucker_graph_input, anchor_relation_embedding)
-        tucker_graph_output = torch.matmul(tucker_graph_output, self.E.weight.transpose(1,0))
-        tucker_graph_output = torch.softmax(tucker_graph_output, dim=1)
+        tucker_graph_output = self.forward_TuckER(tucker_graph_input, anchor_relation_embedding)
 
         return tucker_triplet_output, tucker_graph_output
-
-    def context_subgraph(self, cooccur_idxs) : #-> [([], int)]:
-        """
-        Returns a list of tuples representing the contextual triplets given a anchor entity where the first
-        item in the tuple is the triplet and the second item is the position of the anchor entity in the triplet
-
-        The output includes the query triplet as the first value 
-        """
-        context_subgraph = []
-        locations = []
-        num_context_triplets = []
-
-        for cooccur_idx in cooccur_idxs:
-            location = []
-            context = []
-            n_context = 0
-            for i in range(len(self.contextual_triplets[cooccur_idx.item()])):
-                if i == self.max_context_triplets: break
-                triple = self.contextual_triplets[cooccur_idx.item()][i].copy()
-                loc = triple.index(cooccur_idx.item())
-                triple[loc] = self.entity_mask_idx # replace cooccurring entity index with entity mask index
-                context.append(triple)
-                location.append(loc)
-                n_context += 1
-            locations.append(location)
-            context_subgraph.append(context)
-            num_context_triplets.append(n_context)
-
-        return context_subgraph, locations, num_context_triplets

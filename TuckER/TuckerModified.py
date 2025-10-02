@@ -33,4 +33,23 @@ class TuckER(torch.nn.Module):
         x = self.hidden_dropout2(x)
 
         return x
+    
+    # def forward(self, e1_idx, r_idx):
+    #     e1 = self.E(e1_idx)
+    #     x = self.bn0(e1)
+    #     x = self.input_dropout(x)
+    #     x = x.view(-1, 1, e1.size(1))
+
+    #     r = self.R(r_idx)
+    #     W_mat = torch.mm(r, self.W.view(r.size(1), -1))
+    #     W_mat = W_mat.view(-1, e1.size(1), e1.size(1))
+    #     W_mat = self.hidden_dropout1(W_mat)
+
+    #     x = torch.bmm(x, W_mat) 
+    #     x = x.view(-1, e1.size(1))      
+    #     x = self.bn1(x)
+    #     x = self.hidden_dropout2(x)
+    #     x = torch.mm(x, self.E.weight.transpose(1,0))
+    #     pred = torch.sigmoid(x)
+    #     return pred
 

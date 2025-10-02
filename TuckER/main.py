@@ -113,6 +113,7 @@ class Experiment:
         if self.decay_rate:
             scheduler = ExponentialLR(opt, self.decay_rate)
 
+
         er_vocab = self.get_er_vocab(train_data_idxs)
         er_vocab_pairs = list(er_vocab.keys())
 
@@ -184,7 +185,7 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     dataset = args.dataset
-    data_dir = "data/%s/" % dataset
+    data_dir = "TuckER/data/%s/" % dataset
     torch.backends.cudnn.deterministic = True 
     seed = 20
     np.random.seed(seed)

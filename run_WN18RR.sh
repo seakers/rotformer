@@ -1,0 +1,1 @@
+python trainer.py --dataset=WN18RR --batch_size=1024 --lr=0.0002 --label_smoothing --demb=256 --graph_heads=2 --graph_layer=3 --input_dropout=0.3 --hidden_dropout1=0.4 --hidden_dropout2=0.5
